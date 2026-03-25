@@ -17,5 +17,5 @@ uv run python "$SCRIPT_DIR/demo_unified.py" \
     --render_orig \
     --use_smirk_generator \
     --export_scene \
-    --device cpu \
+    --device auto \
     2>/dev/null

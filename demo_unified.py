@@ -67,8 +67,15 @@ def detect_input_type(path):
         raise ValueError(f"Unsupported file extension: {ext}")
 
 
+def _to_renderer(tensor, renderer_device):
+    """Move tensor to renderer device only if needed."""
+    return tensor.cpu() if renderer_device == 'cpu' and tensor.device.type != 'cpu' else tensor
+
+
 def process_frame(image, args, smirk_encoder, flame, renderer, smirk_generator, face_probabilities):
     """Process a single frame. Returns (grid_numpy, flame_output, outputs, tform_or_None, orig_size)."""
+    device = args.device
+    renderer_device = 'cpu' if str(device).startswith('mps') else str(device)
     orig_h, orig_w, _ = image.shape
     kpt_mediapipe = run_mediapipe(image)
     tform = None
@@ -88,13 +95,18 @@ def process_frame(image, args, smirk_encoder, flame, renderer, smirk_generator, 
     cropped_image = cv2.cvtColor(cropped_image, cv2.COLOR_BGR2RGB)
     cropped_image = cv2.resize(cropped_image, (IMAGE_SIZE, IMAGE_SIZE))
     cropped_image = torch.tensor(cropped_image).permute(2, 0, 1).unsqueeze(0).float() / 255.0
-    cropped_image = cropped_image.to(args.device)
+    cropped_image = cropped_image.to(device)
 
     outputs = smirk_encoder(cropped_image)
     flame_output = flame.forward(outputs)
-    renderer_output = renderer.forward(flame_output['vertices'], outputs['cam'],
-                                       landmarks_fan=flame_output['landmarks_fan'], landmarks_mp=flame_output['landmarks_mp'])
-    rendered_img = renderer_output['rendered_img']
+
+    # pytorch3d rasterizer supports CPU and CUDA but not MPS
+    renderer_output = renderer.forward(
+        _to_renderer(flame_output['vertices'], renderer_device),
+        _to_renderer(outputs['cam'], renderer_device),
+        landmarks_fan=_to_renderer(flame_output['landmarks_fan'], renderer_device),
+        landmarks_mp=_to_renderer(flame_output['landmarks_mp'], renderer_device))
+    rendered_img = renderer_output['rendered_img'].to(device)
 
     # Build visualization grid
     if args.render_orig:
@@ -122,10 +134,12 @@ def process_frame(image, args, smirk_encoder, flame, renderer, smirk_generator, 
         rendered_mask = 1 - (rendered_img == 0).all(dim=1, keepdim=True).float()
         tmask_ratio = mask_ratio * mask_ratio_mul
 
-        npoints, _ = masking_utils.mesh_based_mask_uniform_faces(renderer_output['transformed_vertices'],
-                                                                 flame_faces=flame.faces_tensor,
-                                                                 face_probabilities=face_probabilities,
-                                                                 mask_ratio=tmask_ratio)
+        npoints, _ = masking_utils.mesh_based_mask_uniform_faces(
+            _to_renderer(renderer_output['transformed_vertices'], renderer_device),
+            flame_faces=_to_renderer(flame.faces_tensor, renderer_device),
+            face_probabilities=face_probabilities,
+            mask_ratio=tmask_ratio)
+        npoints = npoints.to(device)
         pmask = torch.zeros_like(rendered_mask)
         rsing = torch.randint(0, 2, (npoints.size(0),)).to(npoints.device) * 2 - 1
         rscale = torch.rand((npoints.size(0),)).to(npoints.device) * (mask_ratio_mul - 1) + 1
@@ -309,7 +323,7 @@ def run_video(args, smirk_encoder, flame, renderer, smirk_generator, face_probab
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='SMIRK unified demo for images and videos')
     parser.add_argument('--input_path', type=str, required=True, help='Path to input image or video')
-    parser.add_argument('--device', type=str, default='cpu', help='Device to run the model on')
+    parser.add_argument('--device', type=str, default='auto', help='Device: cpu, cuda, mps, or auto (auto uses MPS for video on Apple Silicon, CUDA if available)')
     parser.add_argument('--checkpoint', type=str, default='pretrained_models/SMIRK_em1.pt', help='Path to the checkpoint')
     parser.add_argument('--crop', action='store_true', help='Crop the face using mediapipe')
     parser.add_argument('--out_path', type=str, default='results', help='Base output directory')
@@ -324,13 +338,25 @@ if __name__ == '__main__':
     input_name = os.path.splitext(os.path.basename(args.input_path))[0]
     out_dir = os.path.join(args.out_path, input_name)
 
+    # Resolve auto device
+    if args.device == 'auto':
+        if torch.cuda.is_available():
+            args.device = 'cuda'
+        elif input_type == 'video' and torch.backends.mps.is_available():
+            args.device = 'mps'
+        else:
+            args.device = 'cpu'
+
+    # pytorch3d rasterizer supports CPU and CUDA, but not MPS
+    renderer_device = 'cpu' if args.device.startswith('mps') else args.device
+
     # Clean existing results
     if os.path.exists(out_dir):
         shutil.rmtree(out_dir)
     os.makedirs(out_dir)
 
     # Initialize models
-    print("Loading models...")
+    print(f"Loading models... (device: {args.device})")
     t0 = time.time()
 
     smirk_encoder = SmirkEncoder().to(args.device)
@@ -352,7 +378,7 @@ if __name__ == '__main__':
     import io, contextlib
     with contextlib.redirect_stdout(io.StringIO()):
         flame = FLAME().to(args.device)
-        renderer = Renderer().to(args.device)
+        renderer = Renderer().to(renderer_device)
 
     print(f"  Models loaded in {format_time(time.time() - t0)}")
     print(f"Processing {input_type}: {args.input_path}")
