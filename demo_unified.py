@@ -73,24 +73,19 @@ def _to_renderer(tensor, renderer_device):
 
 
 def process_frame(image, args, smirk_encoder, flame, renderer, smirk_generator, face_probabilities):
-    """Process a single frame. Returns (grid_numpy, flame_output, outputs, tform_or_None, orig_size)."""
+    """Process a single frame. Returns (grid_numpy, flame_output, outputs, tform, orig_size)."""
     device = args.device
     renderer_device = 'cpu' if str(device).startswith('mps') else str(device)
     orig_h, orig_w, _ = image.shape
     kpt_mediapipe = run_mediapipe(image)
-    tform = None
 
-    if args.crop:
-        if kpt_mediapipe is None:
-            return None
-        kpt_mediapipe = kpt_mediapipe[..., :2]
-        tform = crop_face(image, kpt_mediapipe, scale=1.4, image_size=IMAGE_SIZE)
-        cropped_image = warp(image, tform.inverse, output_shape=(IMAGE_SIZE, IMAGE_SIZE), preserve_range=True).astype(np.uint8)
-        cropped_kpt_mediapipe = np.dot(tform.params, np.hstack([kpt_mediapipe, np.ones([kpt_mediapipe.shape[0], 1])]).T).T
-        cropped_kpt_mediapipe = cropped_kpt_mediapipe[:, :2]
-    else:
-        cropped_image = image
-        cropped_kpt_mediapipe = kpt_mediapipe
+    if kpt_mediapipe is None:
+        return None
+    kpt_mediapipe = kpt_mediapipe[..., :2]
+    tform = crop_face(image, kpt_mediapipe, scale=1.4, image_size=IMAGE_SIZE)
+    cropped_image = warp(image, tform.inverse, output_shape=(IMAGE_SIZE, IMAGE_SIZE), preserve_range=True).astype(np.uint8)
+    cropped_kpt_mediapipe = np.dot(tform.params, np.hstack([kpt_mediapipe, np.ones([kpt_mediapipe.shape[0], 1])]).T).T
+    cropped_kpt_mediapipe = cropped_kpt_mediapipe[:, :2]
 
     cropped_image = cv2.cvtColor(cropped_image, cv2.COLOR_BGR2RGB)
     cropped_image = cv2.resize(cropped_image, (IMAGE_SIZE, IMAGE_SIZE))
@@ -98,6 +93,11 @@ def process_frame(image, args, smirk_encoder, flame, renderer, smirk_generator, 
     cropped_image = cropped_image.to(device)
 
     outputs = smirk_encoder(cropped_image)
+
+    if args.force_jaw_open is not None:
+        outputs['jaw_params'] = outputs['jaw_params'].clone()
+        outputs['jaw_params'][:, 0] = args.force_jaw_open
+
     flame_output = flame.forward(outputs)
 
     # pytorch3d rasterizer supports CPU and CUDA but not MPS
@@ -108,18 +108,17 @@ def process_frame(image, args, smirk_encoder, flame, renderer, smirk_generator, 
         landmarks_mp=_to_renderer(flame_output['landmarks_mp'], renderer_device))
     rendered_img = renderer_output['rendered_img'].to(device)
 
-    # Build visualization grid
-    if args.render_orig:
-        if args.crop:
-            rendered_img_numpy = (rendered_img.squeeze(0).permute(1, 2, 0).detach().cpu().numpy() * 255.0).astype(np.uint8)
-            rendered_img_orig = warp(rendered_img_numpy, tform, output_shape=(orig_h, orig_w), preserve_range=True).astype(np.uint8)
-            rendered_img_orig = torch.Tensor(rendered_img_orig).permute(2, 0, 1).unsqueeze(0).float() / 255.0
-        else:
-            rendered_img_orig = F.interpolate(rendered_img, (orig_h, orig_w), mode='bilinear').cpu()
-        full_image = torch.Tensor(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)).permute(2, 0, 1).unsqueeze(0).float() / 255.0
-        grid = torch.cat([full_image, rendered_img_orig], dim=3)
-    else:
-        grid = torch.cat([cropped_image, rendered_img], dim=3)
+    full_image = torch.Tensor(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+
+    # Warp rendered mesh back to original frame
+    rendered_img_numpy = (rendered_img.squeeze(0).permute(1, 2, 0).detach().cpu().numpy() * 255.0).astype(np.uint8)
+    rendered_img_orig = warp(rendered_img_numpy, tform, output_shape=(orig_h, orig_w), preserve_range=True).astype(np.uint8)
+    rendered_img_orig = torch.Tensor(rendered_img_orig).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+
+    # Composite mesh overlay onto original frame (non-black pixels)
+    mesh_mask = (rendered_img_orig.sum(dim=1, keepdim=True) > 0).float()
+    mesh_composite = full_image * (1 - mesh_mask) + rendered_img_orig * mesh_mask
+    grid = torch.cat([full_image, mesh_composite], dim=3)
 
     # Neural reconstruction via smirk generator
     if args.use_smirk_generator:
@@ -155,16 +154,14 @@ def process_frame(image, args, smirk_encoder, flame, renderer, smirk_generator, 
         smirk_generator_input = torch.cat([rendered_img, masked_img], dim=1)
         reconstructed_img = smirk_generator(smirk_generator_input)
 
-        if args.render_orig:
-            if args.crop:
-                reconstructed_img_numpy = (reconstructed_img.squeeze(0).permute(1, 2, 0).detach().cpu().numpy() * 255.0).astype(np.uint8)
-                reconstructed_img_orig = warp(reconstructed_img_numpy, tform, output_shape=(orig_h, orig_w), preserve_range=True).astype(np.uint8)
-                reconstructed_img_orig = torch.Tensor(reconstructed_img_orig).permute(2, 0, 1).unsqueeze(0).float() / 255.0
-            else:
-                reconstructed_img_orig = F.interpolate(reconstructed_img, (orig_h, orig_w), mode='bilinear').cpu()
-            grid = torch.cat([grid, reconstructed_img_orig], dim=3)
-        else:
-            grid = torch.cat([grid, reconstructed_img], dim=3)
+        # Warp generator result back to original frame and composite
+        recon_numpy = (reconstructed_img.squeeze(0).permute(1, 2, 0).detach().cpu().numpy() * 255.0).astype(np.uint8)
+        recon_orig = warp(recon_numpy, tform, output_shape=(orig_h, orig_w), preserve_range=True).astype(np.uint8)
+        recon_orig = torch.Tensor(recon_orig).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+
+        recon_mask = (recon_orig.sum(dim=1, keepdim=True) > 0).float()
+        recon_composite = full_image * (1 - recon_mask) + recon_orig * recon_mask
+        grid = torch.cat([grid, recon_composite], dim=3)
 
     grid_numpy = grid.squeeze(0).permute(1, 2, 0).detach().cpu().numpy() * 255.0
     grid_numpy = grid_numpy.astype(np.uint8)
@@ -207,11 +204,10 @@ def export_scene(out_dir, name, flame_output, outputs, flame, tform, orig_size, 
     }
     if frame_index is not None:
         scene_data['frame'] = frame_index
-    if tform is not None:
-        scene_data['crop'] = {
-            'transform_matrix': tform.params.tolist(),
-            'original_image_size': list(orig_size),
-        }
+    scene_data['crop'] = {
+        'transform_matrix': tform.params.tolist(),
+        'original_image_size': list(orig_size),
+    }
 
     json_path = os.path.join(out_dir, f"{prefix}.json")
     with open(json_path, 'w') as f:
@@ -258,11 +254,7 @@ def run_video(args, smirk_encoder, flame, renderer, smirk_generator, face_probab
 
     print(f"  {video_width}x{video_height} @ {video_fps:.1f}fps, {total_frames} frames")
 
-    if args.render_orig:
-        out_w, out_h = video_width, video_height
-    else:
-        out_w, out_h = IMAGE_SIZE, IMAGE_SIZE
-
+    out_w, out_h = video_width, video_height
     out_w *= 3 if args.use_smirk_generator else 2
 
     video_path = os.path.join(out_dir, f"{name}.mp4")
@@ -325,11 +317,11 @@ if __name__ == '__main__':
     parser.add_argument('--input_path', type=str, required=True, help='Path to input image or video')
     parser.add_argument('--device', type=str, default='auto', help='Device: cpu, cuda, mps, or auto (auto uses MPS for video on Apple Silicon, CUDA if available)')
     parser.add_argument('--checkpoint', type=str, default='pretrained_models/SMIRK_em1.pt', help='Path to the checkpoint')
-    parser.add_argument('--crop', action='store_true', help='Crop the face using mediapipe')
     parser.add_argument('--out_path', type=str, default='results', help='Base output directory')
     parser.add_argument('--use_smirk_generator', action='store_true', help='Use SMIRK neural image-to-image translator')
-    parser.add_argument('--render_orig', action='store_true', help='Render result at original image/video resolution')
     parser.add_argument('--export_scene', action='store_true', help='Export OBJ mesh and scene JSON (per frame for video)')
+    parser.add_argument('--force_jaw_open', type=float, default=None, metavar='VALUE',
+                        help='Override jaw opening parameter before rendering (e.g. 0.7 for wide open, 0 for closed)')
     args = parser.parse_args()
 
     total_start = time.time()

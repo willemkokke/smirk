@@ -13,8 +13,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 uv run python "$SCRIPT_DIR/demo_unified.py" \
     --input_path "$1" \
-    --crop \
-    --render_orig \
     --use_smirk_generator \
     --export_scene \
     --device auto \
