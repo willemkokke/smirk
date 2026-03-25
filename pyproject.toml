@@ -1,0 +1,36 @@
+[project]
+name = "smirk"
+version = "0.1.0"
+description = "SMIRK: 3D Facial Expressions through Analysis-by-Neural-Synthesis"
+requires-python = ">=3.9,<3.10"
+dependencies = [
+    "albumentations==1.3.0",
+    "mediapipe>=0.10.14",
+    "numpy>=1.22.4",
+    "omegaconf==2.3.0",
+    "opencv-contrib-python",
+    "opencv-python-headless",
+    "scikit-learn==1.3.2",
+    "scikit-image==0.22.0",
+    "timm==0.9.16",
+    "torch>=2.0.1",
+    "torchvision>=0.15.2",
+    "tqdm==4.66.2",
+    "chumpy==0.70",
+    "gdown",
+    "fvcore",
+    "iopath",
+    "pytorch-lightning==2.2.1",
+    "pytorch3d",
+]
+
+[tool.uv.sources]
+pytorch3d = { git = "https://github.com/facebookresearch/pytorch3d.git" }
+
+[tool.uv.extra-build-dependencies]
+chumpy = ["pip", "setuptools"]
+pytorch3d = ["torch", "setuptools", "numpy"]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"

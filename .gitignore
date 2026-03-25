@@ -10,3 +10,9 @@ assets/LRS3_lists.pkl
 assets/MEAD_lists.pkl
 .vscode
 __pycache__/
+.DS_Store
+FLAME2020.zip
+.venv/
+results/
+*.egg-info/
+*.eggs/
